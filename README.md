@@ -1,7 +1,7 @@
 # mscloud
 - Python temp cloud uploader for bots (queue + polling) -   chat.monasa.net 公益项目   mschat功能之一云盘api版
 # mscloud
-
+chat.monasa.net登入后，在云盘页右上角三条杠里获取api key（免费）
 一个面向机器人场景的临时云盘上传客户端。  
 特点：单文件 `mscloud.py`、固定上传到 `https://chat.monasa.net`、支持队列并发、支持轮询回传链接。
 
