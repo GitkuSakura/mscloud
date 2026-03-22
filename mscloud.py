@@ -1,6 +1,8 @@
 import asyncio
 import json
+import math
 import mimetypes
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,12 +65,14 @@ class _UploadJob:
 
 
 class _TempCloudAsyncClient:
-    def __init__(self, api_key: str, timeout_seconds: float = 180.0):
+    def __init__(self, api_key: str, timeout_seconds: float = 180.0, checkpoint_file: str = ".mscloud_resume.json"):
         self.base_url = BASE_URL
         self.api_key = api_key.strip()
         self.timeout_seconds = float(timeout_seconds)
+        self.checkpoint_file = checkpoint_file
         self._session: Optional[aiohttp.ClientSession] = None
         self._lock = asyncio.Lock()
+        self._checkpoint_lock = asyncio.Lock()
 
     async def close(self):
         if self._session and not self._session.closed:
@@ -93,11 +97,7 @@ class _TempCloudAsyncClient:
         last_error: Optional[Exception] = None
         for attempt in range(retries):
             try:
-                with path.open("rb") as fp:
-                    form = aiohttp.FormData()
-                    form.add_field("file", fp, filename=resolved_filename, content_type=resolved_content_type)
-                    payload = await self._post_json("/api/temp_cloud/v1/upload", form)
-                    return TempCloudUploadResult.from_payload(payload)
+                return await self._upload_resumable(path, resolved_filename, resolved_content_type)
             except (TempCloudAuthError, FileNotFoundError):
                 raise
             except Exception as exc:
@@ -108,6 +108,129 @@ class _TempCloudAsyncClient:
             raise last_error
         raise TempCloudRequestError(500, "upload failed")
 
+    async def _upload_resumable(self, path: Path, filename: str, content_type: str) -> TempCloudUploadResult:
+        size = int(path.stat().st_size)
+        mtime = int(path.stat().st_mtime)
+        key = str(path)
+        try:
+            state = await self._get_checkpoint(key)
+            valid_state = bool(
+                state
+                and state.get("size") == size
+                and state.get("mtime") == mtime
+                and state.get("filename") == filename
+                and state.get("content_type") == content_type
+                and state.get("object_key")
+            )
+            if valid_state:
+                init = {
+                    "mode": state.get("mode"),
+                    "object_key": state.get("object_key"),
+                    "upload_id": state.get("upload_id"),
+                    "part_size": int(state.get("part_size") or 0),
+                    "content_type": content_type,
+                }
+            else:
+                init = await self._post_json(
+                    "/api/temp_cloud/v1/init",
+                    json_data={"filename": filename, "size": size, "content_type": content_type},
+                )
+                await self._set_checkpoint(
+                    key,
+                    {
+                        "size": size,
+                        "mtime": mtime,
+                        "filename": filename,
+                        "content_type": content_type,
+                        "mode": init.get("mode"),
+                        "object_key": init.get("object_key"),
+                        "upload_id": init.get("upload_id") or "",
+                        "part_size": int(init.get("part_size") or 0),
+                        "parts": {},
+                    },
+                )
+            mode = str(init.get("mode") or "")
+            if mode == "single":
+                put_url = (init.get("url") or "").strip()
+                if not put_url:
+                    init = await self._post_json(
+                        "/api/temp_cloud/v1/init",
+                        json_data={"filename": filename, "size": size, "content_type": content_type},
+                    )
+                    put_url = (init.get("url") or "").strip()
+                if not put_url:
+                    raise TempCloudRequestError(500, "missing upload url")
+                await self._put_file(put_url, path, content_type)
+                payload = await self._post_json(
+                    "/api/temp_cloud/v1/complete",
+                    json_data={
+                        "object_key": init.get("object_key"),
+                        "upload_id": "",
+                        "filename": filename,
+                        "content_type": content_type,
+                        "size": size,
+                        "parts": [],
+                    },
+                )
+                await self._delete_checkpoint(key)
+                return TempCloudUploadResult.from_payload(payload)
+
+            object_key = str(init.get("object_key") or "")
+            upload_id = str(init.get("upload_id") or "")
+            part_size = int(init.get("part_size") or 0)
+            if not object_key or not upload_id or part_size <= 0:
+                raise TempCloudRequestError(500, "invalid multipart init")
+            checkpoint = await self._get_checkpoint(key) or {}
+            parts_map = dict(checkpoint.get("parts") or {})
+            total_parts = max(1, math.ceil(size / part_size))
+            with path.open("rb") as fp:
+                for part_number in range(1, total_parts + 1):
+                    part_key = str(part_number)
+                    if parts_map.get(part_key):
+                        continue
+                    offset = (part_number - 1) * part_size
+                    fp.seek(offset)
+                    chunk = fp.read(min(part_size, size - offset))
+                    if not chunk:
+                        raise TempCloudRequestError(500, "empty part")
+                    sign = await self._get_json(
+                        "/api/temp_cloud/v1/sign_part",
+                        params={"object_key": object_key, "upload_id": upload_id, "part_number": str(part_number)},
+                    )
+                    part_url = (sign.get("url") or "").strip()
+                    if not part_url:
+                        raise TempCloudRequestError(500, "missing part url")
+                    etag = await self._put_part(part_url, chunk, content_type)
+                    parts_map[part_key] = etag
+                    checkpoint.update({"parts": parts_map})
+                    await self._set_checkpoint(key, checkpoint)
+            parts = [{"part_number": int(k), "etag": v} for k, v in parts_map.items() if v]
+            parts.sort(key=lambda x: x["part_number"])
+            payload = await self._post_json(
+                "/api/temp_cloud/v1/complete",
+                json_data={
+                    "object_key": object_key,
+                    "upload_id": upload_id,
+                    "filename": filename,
+                    "content_type": content_type,
+                    "size": size,
+                    "parts": parts,
+                },
+            )
+            await self._delete_checkpoint(key)
+            return TempCloudUploadResult.from_payload(payload)
+        except TempCloudAuthError:
+            raise
+        except Exception:
+            return await self._upload_legacy(path, filename, content_type)
+
+    async def _upload_legacy(self, path: Path, filename: str, content_type: str) -> TempCloudUploadResult:
+        form = aiohttp.FormData()
+        with path.open("rb") as fp:
+            form.add_field("file", fp, filename=filename, content_type=content_type)
+            payload = await self._post_json("/api/temp_cloud/v1/upload", data=form)
+        return TempCloudUploadResult.from_payload(payload)
+
     async def _ensure_session(self):
         async with self._lock:
             if self._session and not self._session.closed:
@@ -115,13 +238,44 @@ class _TempCloudAsyncClient:
             timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
             self._session = aiohttp.ClientSession(timeout=timeout)
 
-    async def _post_json(self, path: str, data: Any) -> dict[str, Any]:
+    async def _post_json(self, path: str, data: Any = None, json_data: Any = None) -> dict[str, Any]:
         await self._ensure_session()
         assert self._session is not None
         url = f"{self.base_url}{path}"
         headers = {"X-API-Key": self.api_key}
-        async with self._session.post(url, data=data, headers=headers) as resp:
+        async with self._session.post(url, data=data, json=json_data, headers=headers) as resp:
             return await self._handle_response(resp)
+
+    async def _get_json(self, path: str, params: Optional[dict[str, str]] = None) -> dict[str, Any]:
+        await self._ensure_session()
+        assert self._session is not None
+        url = f"{self.base_url}{path}"
+        headers = {"X-API-Key": self.api_key}
+        async with self._session.get(url, params=params or {}, headers=headers) as resp:
+            return await self._handle_response(resp)
+
+    async def _put_file(self, url: str, path: Path, content_type: str) -> None:
+        await self._ensure_session()
+        assert self._session is not None
+        headers = {"Content-Type": content_type}
+        with path.open("rb") as fp:
+            async with self._session.put(url, data=fp, headers=headers) as resp:
+                if resp.status >= 400:
+                    raise TempCloudRequestError(resp.status, await resp.text())
+
+    async def _put_part(self, url: str, data: bytes, content_type: str) -> str:
+        await self._ensure_session()
+        assert self._session is not None
+        headers = {"Content-Type": content_type}
+        async with self._session.put(url, data=data, headers=headers) as resp:
+            if resp.status >= 400:
+                raise TempCloudRequestError(resp.status, await resp.text())
+            etag = (resp.headers.get("ETag") or "").strip().strip('"')
+            if not etag:
+                etag = (await resp.text()).strip().strip('"')
+            if not etag:
+                raise TempCloudRequestError(resp.status, "missing etag")
+            return etag
 
     async def _handle_response(self, resp: aiohttp.ClientResponse) -> dict[str, Any]:
         text = await resp.text()
@@ -142,6 +296,42 @@ class _TempCloudAsyncClient:
         if payload.get("success") is False:
             raise TempCloudRequestError(resp.status, str(payload.get("error", "request failed")), payload)
         return payload
+
+    async def _load_all_checkpoints(self) -> dict[str, Any]:
+        async with self._checkpoint_lock:
+            if not os.path.exists(self.checkpoint_file):
+                return {}
+            try:
+                with open(self.checkpoint_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                return {}
+            return {}
+
+    async def _write_all_checkpoints(self, data: dict[str, Any]) -> None:
+        async with self._checkpoint_lock:
+            tmp_path = f"{self.checkpoint_file}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp_path, self.checkpoint_file)
+
+    async def _get_checkpoint(self, path_key: str) -> Optional[dict[str, Any]]:
+        all_state = await self._load_all_checkpoints()
+        state = all_state.get(path_key)
+        return state if isinstance(state, dict) else None
+
+    async def _set_checkpoint(self, path_key: str, state: dict[str, Any]) -> None:
+        all_state = await self._load_all_checkpoints()
+        all_state[path_key] = state
+        await self._write_all_checkpoints(all_state)
+
+    async def _delete_checkpoint(self, path_key: str) -> None:
+        all_state = await self._load_all_checkpoints()
+        if path_key in all_state:
+            all_state.pop(path_key, None)
+            await self._write_all_checkpoints(all_state)
 
 
 class MsCloudApp:
