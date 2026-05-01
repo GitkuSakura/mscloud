@@ -13,6 +13,19 @@ import aiohttp
 
 BASE_URL = "https://chat.monasa.net"
 
+def _normalize_bucket(value: str) -> str:
+    raw = (value or "").strip().lower()
+    if raw == "west":
+        return "west"
+    return "east"
+
+def _bucket_to_region(bucket: str) -> str:
+    return "west" if _normalize_bucket(bucket) == "west" else "east"
+
+def _normalize_upload_mode(value: str) -> str:
+    raw = (value or "").strip().lower()
+    return "imgbed" if raw in ("imgbed", "image", "image_bed", "image-bed") else "temp_cloud"
+
 
 class TempCloudError(Exception):
     pass
@@ -40,18 +53,24 @@ class TempCloudUploadResult:
     content_type: str
     size: int
     expires_at: str
+    bucket: str = "east"
+    mode: str = "temp_cloud"
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "TempCloudUploadResult":
+        bucket = _normalize_bucket(str(payload.get("bucket") or payload.get("region") or "east"))
+        mode = _normalize_upload_mode(str(payload.get("mode") or payload.get("scope") or payload.get("upload_mode") or "temp_cloud"))
         return cls(
             success=bool(payload.get("success")),
             share_id=str(payload.get("share_id", "")),
             share_url=str(payload.get("share_url", "")),
-            file_url=str(payload.get("file_url", "")),
+            file_url=str(payload.get("file_url", "") or payload.get("image_url", "")),
             filename=str(payload.get("filename", "")),
             content_type=str(payload.get("content_type", "")),
             size=int(payload.get("size", 0)),
             expires_at=str(payload.get("expires_at", "")),
+            bucket=bucket,
+            mode=mode,
         )
 
 
@@ -60,16 +79,19 @@ class _UploadJob:
     file_path: str | Path
     filename: Optional[str]
     content_type: Optional[str]
+    upload_mode: Optional[str]
     retry_count: Optional[int]
     retry_interval_seconds: Optional[float]
 
 
 class _TempCloudAsyncClient:
-    def __init__(self, api_key: str, timeout_seconds: float = 180.0, checkpoint_file: str = ".mscloud_resume.json"):
+    def __init__(self, api_key: str, timeout_seconds: float = 600.0, checkpoint_file: str = ".mscloud_resume.json", region: str = "east", bucket: str = "east"):
         self.base_url = BASE_URL
         self.api_key = api_key.strip()
         self.timeout_seconds = float(timeout_seconds)
         self.checkpoint_file = checkpoint_file
+        self.bucket = _normalize_bucket(bucket or region)
+        self.region = _bucket_to_region(self.bucket)
         self._session: Optional[aiohttp.ClientSession] = None
         self._lock = asyncio.Lock()
         self._checkpoint_lock = asyncio.Lock()
@@ -84,6 +106,7 @@ class _TempCloudAsyncClient:
         file_path: str | Path,
         filename: Optional[str] = None,
         content_type: Optional[str] = None,
+        upload_mode: str = "temp_cloud",
         retry_count: int = 1,
         retry_interval_seconds: float = 0.6,
     ) -> TempCloudUploadResult:
@@ -95,8 +118,11 @@ class _TempCloudAsyncClient:
         retries = max(1, int(retry_count))
         interval = float(retry_interval_seconds)
         last_error: Optional[Exception] = None
+        mode = _normalize_upload_mode(upload_mode)
         for attempt in range(retries):
             try:
+                if mode == "imgbed":
+                    return await self._upload_imgbed(path, resolved_filename, resolved_content_type)
                 return await self._upload_resumable(path, resolved_filename, resolved_content_type)
             except (TempCloudAuthError, FileNotFoundError):
                 raise
@@ -121,6 +147,7 @@ class _TempCloudAsyncClient:
                 and state.get("filename") == filename
                 and state.get("content_type") == content_type
                 and state.get("object_key")
+                and state.get("region") == self.region
             )
             if valid_state:
                 init = {
@@ -133,7 +160,7 @@ class _TempCloudAsyncClient:
             else:
                 init = await self._post_json(
                     "/api/temp_cloud/v1/init",
-                    json_data={"filename": filename, "size": size, "content_type": content_type},
+                    json_data={"filename": filename, "size": size, "content_type": content_type, "region": self.region},
                 )
                 await self._set_checkpoint(
                     key,
@@ -146,6 +173,8 @@ class _TempCloudAsyncClient:
                         "object_key": init.get("object_key"),
                         "upload_id": init.get("upload_id") or "",
                         "part_size": int(init.get("part_size") or 0),
+                        "part_concurrency": int(init.get("part_concurrency") or 5),
+                        "region": self.region,
                         "parts": {},
                     },
                 )
@@ -155,7 +184,7 @@ class _TempCloudAsyncClient:
                 if not put_url:
                     init = await self._post_json(
                         "/api/temp_cloud/v1/init",
-                        json_data={"filename": filename, "size": size, "content_type": content_type},
+                        json_data={"filename": filename, "size": size, "content_type": content_type, "region": self.region},
                     )
                     put_url = (init.get("url") or "").strip()
                 if not put_url:
@@ -169,6 +198,7 @@ class _TempCloudAsyncClient:
                         "filename": filename,
                         "content_type": content_type,
                         "size": size,
+                        "region": self.region,
                         "parts": [],
                     },
                 )
@@ -178,32 +208,61 @@ class _TempCloudAsyncClient:
             object_key = str(init.get("object_key") or "")
             upload_id = str(init.get("upload_id") or "")
             part_size = int(init.get("part_size") or 0)
+            part_concurrency = max(1, int(init.get("part_concurrency") or 5))
             if not object_key or not upload_id or part_size <= 0:
                 raise TempCloudRequestError(500, "invalid multipart init")
             checkpoint = await self._get_checkpoint(key) or {}
             parts_map = dict(checkpoint.get("parts") or {})
             total_parts = max(1, math.ceil(size / part_size))
-            with path.open("rb") as fp:
-                for part_number in range(1, total_parts + 1):
-                    part_key = str(part_number)
-                    if parts_map.get(part_key):
-                        continue
-                    offset = (part_number - 1) * part_size
-                    fp.seek(offset)
-                    chunk = fp.read(min(part_size, size - offset))
-                    if not chunk:
-                        raise TempCloudRequestError(500, "empty part")
-                    sign = await self._get_json(
-                        "/api/temp_cloud/v1/sign_part",
-                        params={"object_key": object_key, "upload_id": upload_id, "part_number": str(part_number)},
-                    )
-                    part_url = (sign.get("url") or "").strip()
-                    if not part_url:
-                        raise TempCloudRequestError(500, "missing part url")
-                    etag = await self._put_part(part_url, chunk, content_type)
-                    parts_map[part_key] = etag
-                    checkpoint.update({"parts": parts_map})
-                    await self._set_checkpoint(key, checkpoint)
+            missing_parts = [pn for pn in range(1, total_parts + 1) if not parts_map.get(str(pn))]
+            if missing_parts:
+                update_lock = asyncio.Lock()
+                parts_queue: asyncio.Queue[int] = asyncio.Queue()
+                for pn in missing_parts:
+                    parts_queue.put_nowait(pn)
+                errors: list[Exception] = []
+
+                async def _worker():
+                    while True:
+                        try:
+                            part_number = parts_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            return
+                        try:
+                            offset = (part_number - 1) * part_size
+                            read_len = min(part_size, size - offset)
+                            chunk = await self._read_part_bytes(path, offset, read_len)
+                            if not chunk:
+                                raise TempCloudRequestError(500, "empty part")
+                            sign = await self._get_json(
+                                "/api/temp_cloud/v1/sign_part",
+                                params={
+                                    "object_key": object_key,
+                                    "upload_id": upload_id,
+                                    "part_number": str(part_number),
+                                    "region": self.region,
+                                },
+                            )
+                            part_url = (sign.get("url") or "").strip()
+                            if not part_url:
+                                raise TempCloudRequestError(500, "missing part url")
+                            etag = await self._put_part(part_url, chunk, content_type)
+                            async with update_lock:
+                                parts_map[str(part_number)] = etag
+                                checkpoint.update({"parts": parts_map, "part_concurrency": part_concurrency, "region": self.region})
+                                await self._set_checkpoint(key, checkpoint)
+                        except Exception as e:
+                            errors.append(e)
+                        finally:
+                            parts_queue.task_done()
+
+                workers = [asyncio.create_task(_worker()) for _ in range(min(part_concurrency, len(missing_parts)))]
+                await parts_queue.join()
+                for w in workers:
+                    w.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+                if errors:
+                    raise errors[0]
             parts = [{"part_number": int(k), "etag": v} for k, v in parts_map.items() if v]
             parts.sort(key=lambda x: x["part_number"])
             payload = await self._post_json(
@@ -214,6 +273,7 @@ class _TempCloudAsyncClient:
                     "filename": filename,
                     "content_type": content_type,
                     "size": size,
+                    "region": self.region,
                     "parts": parts,
                 },
             )
@@ -221,14 +281,23 @@ class _TempCloudAsyncClient:
             return TempCloudUploadResult.from_payload(payload)
         except TempCloudAuthError:
             raise
-        except Exception:
-            return await self._upload_legacy(path, filename, content_type)
+        except TempCloudRequestError as e:
+            if e.status in (404, 405, 501):
+                return await self._upload_legacy(path, filename, content_type)
+            raise
 
     async def _upload_legacy(self, path: Path, filename: str, content_type: str) -> TempCloudUploadResult:
         form = aiohttp.FormData()
         with path.open("rb") as fp:
             form.add_field("file", fp, filename=filename, content_type=content_type)
-            payload = await self._post_json("/api/temp_cloud/v1/upload", data=form)
+            payload = await self._post_json(f"/api/temp_cloud/v1/upload?region={self.region}", data=form)
+        return TempCloudUploadResult.from_payload(payload)
+
+    async def _upload_imgbed(self, path: Path, filename: str, content_type: str) -> TempCloudUploadResult:
+        form = aiohttp.FormData()
+        with path.open("rb") as fp:
+            form.add_field("file", fp, filename=filename, content_type=content_type)
+            payload = await self._post_json(f"/api/imgbed/v1/upload?bucket={self.bucket}", data=form)
         return TempCloudUploadResult.from_payload(payload)
 
     async def _ensure_session(self):
@@ -276,6 +345,14 @@ class _TempCloudAsyncClient:
             if not etag:
                 raise TempCloudRequestError(resp.status, "missing etag")
             return etag
+
+    async def _read_part_bytes(self, path: Path, offset: int, size: int) -> bytes:
+        def _read():
+            with path.open("rb") as fp:
+                fp.seek(offset)
+                return fp.read(size)
+
+        return await asyncio.to_thread(_read)
 
     async def _handle_response(self, resp: aiohttp.ClientResponse) -> dict[str, Any]:
         text = await resp.text()
@@ -339,9 +416,12 @@ class MsCloudApp:
         self,
         api_key: str,
         que_max: int = 3,
-        timeout_seconds: float = 180.0,
-        retry_count: int = 1,
+        timeout_seconds: float = 600.0,
+        retry_count: int = 2,
         retry_interval_seconds: float = 0.6,
+        region: str = "east",
+        bucket: Optional[str] = None,
+        upload_mode: str = "temp_cloud",
     ):
         self.api_key = api_key.strip()
         self.que_max = max(1, int(que_max))
@@ -349,6 +429,9 @@ class MsCloudApp:
         self.timeout_seconds = float(timeout_seconds)
         self.retry_count = max(1, int(retry_count))
         self.retry_interval_seconds = float(retry_interval_seconds)
+        self.bucket = _normalize_bucket(bucket or region)
+        self.region = _bucket_to_region(self.bucket)
+        self.upload_mode = _normalize_upload_mode(upload_mode)
         self._loop = asyncio.new_event_loop()
         self._ready = threading.Event()
         self._closed = threading.Event()
@@ -367,6 +450,7 @@ class MsCloudApp:
         file_path: str | Path,
         filename: Optional[str] = None,
         content_type: Optional[str] = None,
+        upload_mode: Optional[str] = None,
         retry_count: Optional[int] = None,
         retry_interval_seconds: Optional[float] = None,
     ) -> None:
@@ -379,6 +463,7 @@ class MsCloudApp:
             file_path=file_path,
             filename=filename,
             content_type=content_type,
+            upload_mode=_normalize_upload_mode(upload_mode or self.upload_mode),
             retry_count=retry_count if retry_count is not None else self.retry_count,
             retry_interval_seconds=retry_interval_seconds if retry_interval_seconds is not None else self.retry_interval_seconds,
         )
@@ -415,7 +500,12 @@ class MsCloudApp:
 
     async def _bootstrap(self):
         self._queue = asyncio.Queue(maxsize=self.que_max)
-        self._client = _TempCloudAsyncClient(api_key=self.api_key, timeout_seconds=self.timeout_seconds)
+        self._client = _TempCloudAsyncClient(
+            api_key=self.api_key,
+            timeout_seconds=self.timeout_seconds,
+            region=self.region,
+            bucket=self.bucket,
+        )
         self._workers_tasks = [asyncio.create_task(self._worker()) for _ in range(self.workers)]
         self._ready.set()
 
@@ -437,6 +527,7 @@ class MsCloudApp:
                     file_path=job.file_path,
                     filename=job.filename,
                     content_type=job.content_type,
+                    upload_mode=job.upload_mode or self.upload_mode,
                     retry_count=job.retry_count,
                     retry_interval_seconds=job.retry_interval_seconds,
                 )
@@ -465,18 +556,28 @@ class MsCloudApp:
         self._loop.call_soon(self._loop.stop)
 
 
-def app(api_key: str, que_max: int = 3, timeout_seconds: float = 180.0) -> MsCloudApp:
+def app(
+    api_key: str,
+    que_max: int = 3,
+    timeout_seconds: float = 600.0,
+    region: str = "east",
+    bucket: Optional[str] = None,
+    upload_mode: str = "temp_cloud",
+) -> MsCloudApp:
     return MsCloudApp(
         api_key=api_key,
         que_max=que_max,
         timeout_seconds=timeout_seconds,
+        region=region,
+        bucket=bucket,
+        upload_mode=upload_mode,
     )
 
 
 # 基本食用示例:
 # import mscloud
 #que_max:最大同时处理
-# client = mscloud.app(api_key="xxx", que_max=3)
+# client = mscloud.app(api_key="xxx", que_max=3, region="east")
 # client.load("path/to/file1.mp4")
 # client.load("path/to/file2.zip")
 # client.wait()
@@ -488,7 +589,7 @@ def app(api_key: str, que_max: int = 3, timeout_seconds: float = 180.0) -> MsClo
 # 嵌入机器人主循环（伪代码 记得替换成你自己的方法）
 
 # import mscloud
-# c = mscloud.app(api_key="xxx", que_max=6)
+# c = mscloud.app(api_key="xxx", que_max=6, region="west")
 # pending = {}  # {file_path: user_id}
 
 # while True:
